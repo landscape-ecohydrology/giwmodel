@@ -171,82 +171,153 @@ def run_model():
             #explicit adaptive Runge-Kutta numerical solver
             method="RK45",
         )
+        #update c/n state 
+        #sol.y contains the solution throughout the integration
+        #[:, -1] selects the final value of every state variable at the end of the timestep
+        #which becomes the initial condition for the next timestep 
         state = sol.y[:, -1]
+        #prevent NH4 and NO3 concentrations from becoming negative due to numerical errors
         state[6:8] = np.maximum(state[6:8], 0.0)
+        #prenvent Cl, Ch, Cb, Nl, Nh, Nb from becoming negative due to numerical errors
         state[:6] = np.maximum(state[:6], 0.0)
-
+        #save the current state values into their full simulation time-series arrays 
         for i, name in enumerate(["Cl", "Ch", "Cb", "Nl", "Nh", "Nb", "NH4", "NO3"]):
             bio[name][t] = state[i]
 
         # Recompute and store the same diagnostic C/N fluxes
+        #coupled_rhs() calculates these processes internally while solving the ODEs
+        #here they are recalculated once at the final state of the timestep so that we can save them for plotting, mass balances, and analysis
+        #soil moisture response functions
+        #moisture limitation factor used for decomposition
         fd_s = fd(s_cur, cfg)
+        #moisture limitation factor used for nitrification
         fn_s = fn(s_cur, cfg)
+        #give names to each value in the state array so the equations are easier to read
         Cl, Ch, Cb, Nl, Nh, Nb, NH4, NO3 = state
+        #calculate the current litter c/n ratio
+        #max(..., 1e-12) is used to prevent division by zero
         CN_lit = Cl / max(Nl, 1e-12)
+        #determine how much decomposed litter can be transferred into the humus pool 
+        #rh_eff cannot exceed rh_max, and is also limited by the current litter c/n ratio and the humus c/n ratio
         rh_eff = min(cfg.params["rh_max"], cfg.params["CNh"] / max(CN_lit, 1e-12))
 
+        #phi_den describes the balance between nitrogen released from decomposition and nitrogen required for microbial growth
         phi_den = cfg.params["kh"] * Ch * (1.0/cfg.params["CNh"] - (1.0-cfg.params["rr"])/cfg.params["CNb"]) \
             + cfg.params["kl"] * Cl * (1.0/CN_lit - rh_eff/cfg.params["CNh"] - (1.0-rh_eff-cfg.params["rr"])/cfg.params["CNb"])
+        #amount of mineral nitrogen potentially available for immobilization
         phi_num = -(cfg.params["ki_plus"] * NH4 + cfg.params["ki_minus"] * NO3)
+        #if decomposition releases enough nitrogen, decomposition does not need to be N limited
         if phi_den >= 0.0:
             phi_small = 1.0
-        else:
+        else: #otherwise determine how strongly mineral nitrogen limits decomposition
             phi_small = phi_num / max(phi_den, -1e-12)
+            #force the limiter to remain between 0 and 1 
             phi_small = max(0.0, min(1.0, phi_small))
-
+        #CARBON DECOMPOSITION
+        #litter decomposition rate
         DECl = phi_small * fd_s * cfg.params["kl"] * Cb * Cl
+        #humus decomposition rate
         DECh = cfg.params["fclay"] * phi_small * fd_s * cfg.params["kh"] * Cb * Ch
+        #microbial biomass mortality rate
         BD = cfg.params["kd"] * Cb
+        #SAVE CARBON FLUXES
+        #multiply rates by dt to convert amount/day to amount/timestep
         bio["DEC_L_flux"][t] = DECl * cfg.dt
         bio["DEC_H_flux"][t] = DECh * cfg.dt
         bio["BD_flux"][t] = BD * cfg.dt
+        #fraction rr of decomposed carbon is respired as CO2 
         bio["CO2_flux"][t] = cfg.params["rr"] * (DECl + DECh) * cfg.dt
 
+        #MINERALIZATION AND IMMOBILIZATION
+
+        #net mineralization/immobilization rate 
+        #positive phi = net mineralization, negative phi = net immobilization
         PHI = phi_small * fd_s * Cb * phi_den
+
+        #maximum amount of mineral N that microbes could immobilize 
         IMM_max = (cfg.params["ki_plus"]*NH4 + cfg.params["ki_minus"]*NO3) * fd_s * Cb
+        #if phi is positive, nitrogen is mineralized and there is no immobilization
         if PHI > 0.0:
             IMM = 0.0
-        else:
+        else: #if phi is negative, microbes immobilize mineral nitrogen, but not more than is available in the soil
             IMM = min(-PHI, IMM_max)
+        #denominator used to divide immobilization between ammonium and nitrate pools
         den_imm = max(cfg.params["ki_plus"]*NH4 + cfg.params["ki_minus"]*NO3, 1e-12)
+        #portion of immobilization taken from NH4
         IMM_NH4 = IMM * (cfg.params["ki_plus"] * NH4) / den_imm
+        #portion of immobilization taken from NO3
         IMM_NO3 = IMM * (cfg.params["ki_minus"] * NO3) / den_imm
+        #NITRIFICATION
+        #convert NH4 to NO3
+        #nitrification depends on nitrification coefficient kn, soil moisture response fn_s, microbial biomass Cb, and NH4 concentration
         NIT = cfg.params["kn"] * fn_s * Cb * NH4
+        #store internal N fluxes
+        #convert rates to timestep totals using dt 
         bio["NIT_flux"][t] = NIT * cfg.dt
+        #only positive PHI represents mineralization 
         bio["MIN_flux"][t] = max(0.0, PHI) * cfg.dt
         bio["IMM_NH4_flux"][t] = IMM_NH4 * cfg.dt
         bio["IMM_NO3_flux"][t] = IMM_NO3 * cfg.dt
 
+        #N LEACHING 
+        #hydrologically driven NH4 loss and NO3 loss from the soil
         bio["LE_NH4_flux"][t] = cfg.params["a_plus"] * Lrate * NH4 * cfg.dt
         bio["LE_NO3_flux"][t] = cfg.params["a_minus"] * Lrate * NO3 * cfg.dt
-
+        #passive NH4 uptake associated with water uptake
         UP_p_NH4 = cfg.params["a_plus"] * Trate * NH4
+        #passive NO3 uptake associated with water uptake
         UP_p_NO3 = cfg.params["a_minus"] * Trate * NO3
+        #ACTIVE PLANT UPTAKE
+        #potential active NH4 uptake coefficient
+        #uptake increases with soil moisture according to s^dd 
         ku_plus = cfg.params["a_plus"] * cfg.params["F"] * (s_cur ** cfg.params["dd"]) / water_vol
+        #potential active NO3 uptake coefficient
         ku_minus = cfg.params["a_minus"] * cfg.params["F"] * (s_cur ** cfg.params["dd"]) / water_vol
+        #remaining plant NH4 demand after passive uptake
         dem_p = max(cfg.params["DEM_plus"] - UP_p_NH4, 0.0)
+        #remaining plant NO3 demand after passive uptake
         dem_m = max(cfg.params["DEM_minus"] - UP_p_NO3, 0.0)
+        #active nh4 uptake cannot exceed remaining plant demand or the potential uptake rate
         UP_a_NH4 = min(ku_plus * NH4, dem_p)
+        #active no3 uptake cannot exceed remaining plant demand or the potential uptake rate
         UP_a_NO3 = min(ku_minus * NO3, dem_m)
+        #total NH4 uptake = passive + active uptake
         bio["UP_NH4_flux"][t] = (UP_p_NH4 + UP_a_NH4) * cfg.dt
+        #total NO3 uptake = passive + active uptake
         bio["UP_NO3_flux"][t] = (UP_p_NO3 + UP_a_NO3) * cfg.dt
 
+        #DENITRIFICATION    
+        #no denitrification occurs below field capacity
         if s_cur <= cfg.sfc:
             fs_den = 0.0
-        else:
+        else: #above field capacity, denitrification increases as the soil approaches full saturation 
             fs_den = ((s_cur - cfg.sfc) / max(1.0 - cfg.sfc, 1e-12)) ** cfg.params["w"]
+        #nitrate limitation factor for denitrification
+        #at low nitrate concentrations, denitrification is limited by the availability of nitrate
+        #at high nitrate concentration, this factor approaches 1 and denitrification is limited by soil moisture
         fN_den = NO3 / (cfg.params["Kmm"] + NO3)
+        #calculate total N lost by denitrification during this timestep
         DENIT_step = cfg.params["k_den"] * fN_den * fs_den * NO3 * cfg.dt
+        #store total denitrification fluxes
         bio["DENIT_flux"][t] = DENIT_step
+        #assume that half of the denitrified nitrogen is lost as N2 and half as N2O
+        #this is a fixed partition rather than a dynamically modeled ratio, could modify later 
         bio["N2O_flux"][t] = 0.5 * DENIT_step
         bio["N2_flux"][t] = 0.5 * DENIT_step
-
+    #end of time loop 
+    #packaging the hydrology and biogeochemistry together into one results object
+    #making it easy to pass all model output to the diagnostics and plotting functions
     return {"hydro": hydro, "bio": bio}, rain
 
-
+    #main output/diagnostics function 
 def main():
+    """
+    run the model, calculate diagnostics, create output tables, and generate plots. 
+    """
+    #run the complete simulation
+    #results contains the hydrology and biogeochemistry results, rain contains the rainfall time series
     results, rain = run_model()
-
+    #check conservation of mass for water, carbon, and nitrogen
     print_water_balance(results, rain, cfg)
     print_carbon_balance(results, cfg)
     print_nitrogen_balance(results, cfg)
@@ -254,7 +325,7 @@ def main():
     df_report = build_report_dataframe(results, rain, cfg)
     # df_report.to_csv(f"soil_water_carbon_output_{cfg.selected_soil}.csv", index=False)
 
-
+    #plot 14 day period starting on day 100
     plot_hydrology_zoom(
         results,
         rain,
@@ -262,7 +333,9 @@ def main():
         start_day=100,
         days=14
     )
+    #plot soil moisture, rainfall, et, infiltration, leakage, runoff, and water table behavior 
     plot_hydrology(results, rain, cfg)
+    #plot carbon and nitrogen pools and fluxes
     plot_carbon(results, cfg)
     plot_nitrogen(results, cfg)
     if cfg.PLOT_PAPER_FIGS:
